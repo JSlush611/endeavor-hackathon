@@ -1,16 +1,9 @@
 import httpx
 import os
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict
 from models import Order, LineItem, Product, db_session
 from sqlalchemy import select
 import logging
-from difflib import SequenceMatcher
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-from datetime import datetime
-from sqlalchemy.orm import Session
-from .matching import CustomMatcher
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -19,193 +12,106 @@ logger = logging.getLogger(__name__)
 EXTRACTION_API_URL = "https://plankton-app-qajlk.ondigitalocean.app"
 MATCHING_API_URL = "https://endeavor-interview-api-gzwki.ondigitalocean.app"
 
-# Initialize the custom matcher
-matcher = CustomMatcher()
-
-async def extract_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
-    """Extract items from PDF using the extraction API."""
-    try:
-        async with httpx.AsyncClient() as client:
-            with open(pdf_path, 'rb') as f:
-                files = {'file': ('document.pdf', f, 'application/pdf')}
-                response = await client.post(
-                    'http://localhost:5000/extract',
-                    files=files
-                )
-                response.raise_for_status()
-                data = response.json()
-                logger.info(f"Extracted {len(data.get('items', []))} items from PDF")
-                return data.get('items', [])
-    except Exception as e:
-        logger.error(f"Error extracting from PDF: {str(e)}")
-        raise
+async def extract_from_pdf(file_path: str) -> List[Dict]:
+    """Extract line items from PDF using the extraction API."""
+    async with httpx.AsyncClient() as client:
+        with open(file_path, 'rb') as f:
+            files = {'file': (os.path.basename(file_path), f, 'application/pdf')}
+            response = await client.post(
+                f"{EXTRACTION_API_URL}/extraction_api",
+                files=files
+            )
+            if response.status_code != 200:
+                raise Exception(f'Extraction failed: {response.text}')
+            
+            logger.info(f"Extraction response: {response.text}")
+            return response.json()
 
 def find_product_by_description(description: str) -> Product | None:
     """Find a product by its exact description."""
     stmt = select(Product).where(Product.description == description)
     return db_session.execute(stmt).scalar_one_or_none()
 
-def calculate_fuzzy_score(text1: str, text2: str) -> float:
-    """Calculate fuzzy matching score using SequenceMatcher."""
-    return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+async def match_items(extracted_items: List[Dict]) -> Dict[str, List[Dict]]:
+    """Match extracted items with products using the matching API."""
+    # Extract just the item descriptions for matching
+    item_descriptions = [item["Request Item"] for item in extracted_items]
+    logger.info(f"Sending items for matching: {item_descriptions}")
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{MATCHING_API_URL}/match/batch",
+            params={"limit": 5},
+            json={"queries": item_descriptions}
+        )
+        if response.status_code != 200:
+            raise Exception(f'Matching failed: {response.text}')
+        
+        logger.info(f"Matching response: {response.text}")
+        return response.json()['results']
 
-def calculate_feature_score(item: str, product: Product) -> float:
-    """Calculate score based on product features."""
-    features = [
-        product.material,
-        product.size,
-        product.length,
-        product.coating,
-        product.thread_type
-    ]
-    feature_scores = [calculate_fuzzy_score(item, f) for f in features if f]
-    return np.mean(feature_scores) if feature_scores else 0
-
-def calculate_semantic_score(item: str, product: Product, vectorizer: TfidfVectorizer, tfidf_matrix: np.ndarray) -> float:
-    """Calculate semantic similarity using TF-IDF and cosine similarity."""
-    item_vector = vectorizer.transform([item])
-    product_vector = vectorizer.transform([product.description])
-    return cosine_similarity(item_vector, product_vector)[0][0]
-
-def get_best_matches(extracted_items: List[str], top_k: int = 5) -> List[Dict]:
-    """Find the best matches for extracted items using a combination of matching algorithms."""
+async def process_order(file_path: str, filename: str) -> Order:
+    """Process an uploaded order file."""
+    # Initialize order variable in outer scope
+    order = None
+    
     try:
-        # Get all products from database
-        stmt = select(Product)
-        products = db_session.execute(stmt).scalars().all()
+        # Get the order first
+        stmt = select(Order).where(Order.filename == filename)
+        order = db_session.execute(stmt).scalar_one_or_none()
         
-        if not products:
-            logger.error("No products found in database")
-            return []
-
-        # Prepare TF-IDF vectors for semantic matching
-        product_descriptions = [p.description for p in products]
-        vectorizer = TfidfVectorizer(stop_words='english')
-        tfidf_matrix = vectorizer.fit_transform(product_descriptions)
-
-        results = []
-        for item in extracted_items:
-            matches = []
-            for product in products:
-                # Calculate different similarity scores
-                fuzzy_score = calculate_fuzzy_score(item, product.description)
-                feature_score = calculate_feature_score(item, product)
-                semantic_score = calculate_semantic_score(item, product, vectorizer, tfidf_matrix)
-
-                # Combine scores with weights
-                combined_score = (
-                    0.4 * fuzzy_score +  # Text similarity
-                    0.3 * feature_score +  # Feature matching
-                    0.3 * semantic_score  # Semantic similarity
-                )
-
-                matches.append({
-                    'product_id': product.id,
-                    'description': product.description,
-                    'category': product.type,
-                    'material': product.material,
-                    'size': product.size,
-                    'length': product.length,
-                    'coating': product.coating,
-                    'thread_type': product.thread_type,
-                    'unit_price': product.unit_price,
-                    'confidence_score': combined_score * 100,  # Convert to percentage
-                    'match_details': {
-                        'text_similarity': fuzzy_score * 100,
-                        'feature_match': feature_score * 100,
-                        'semantic_similarity': semantic_score * 100
-                    }
-                })
-
-            # Sort by combined score and get top matches
-            matches.sort(key=lambda x: x['confidence_score'], reverse=True)
-            results.append({
-                'extracted_text': item,
-                'matches': matches[:top_k]
-            })
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Error in custom matching: {str(e)}")
-        raise
-
-async def match_items(extracted_items: List[Dict[str, Any]], db: Session) -> List[Dict[str, Any]]:
-    """Match extracted items against product catalog using custom matcher."""
-    try:
-        # Get all products from database
-        products = db.execute("SELECT id, description, part_number, category FROM products").fetchall()
-        products = [dict(row) for row in products]
-        
-        # Fit the matcher with product data
-        matcher.fit(products)
-        
-        # Extract descriptions for matching
-        queries = [item.get('Request Item', '') for item in extracted_items]
-        
-        # Get matches for all items
-        matches = matcher.batch_match(queries)
-        
-        # Format results
-        results = []
-        for item, item_matches in zip(extracted_items, matches):
-            matched_products = []
-            for product_id, score in item_matches:
-                product = next((p for p in products if p['id'] == product_id), None)
-                if product:
-                    matched_products.append({
-                        'id': product_id,
-                        'description': product['description'],
-                        'part_number': product['part_number'],
-                        'confidence': score
-                    })
-            
-            results.append({
-                'extracted_text': item.get('Request Item', ''),
-                'quantity': item.get('Quantity', 0),
-                'matches': matched_products
-            })
-        
-        logger.info(f"Matched {len(results)} items against product catalog")
-        return results
-    except Exception as e:
-        logger.error(f"Error matching items: {str(e)}")
-        raise
-
-async def process_order(order_id: int, db: Session):
-    """Process an order through the pipeline."""
-    try:
-        order = db.query(Order).filter(Order.id == order_id).first()
         if not order:
-            raise ValueError(f"Order {order_id} not found")
-        
-        # Update status to processing
-        order.status = OrderStatus.PROCESSING
-        db.commit()
+            raise Exception("Order not found")
         
         # Extract items from PDF
-        extracted_items = await extract_from_pdf(order.file_path)
+        extracted_items = await extract_from_pdf(file_path)
+        logger.info(f"Extracted {len(extracted_items)} items from PDF")
         
-        # Match items against product catalog
-        matched_items = await match_items(extracted_items, db)
+        # Match items with products
+        matches_by_query = await match_items(extracted_items)
+        logger.info(f"Received matches for {len(matches_by_query)} items")
         
         # Create line items
-        for item in matched_items:
+        for item_data in extracted_items:
+            request_item = item_data["Request Item"]
+            item_matches = matches_by_query.get(request_item, [])
+            best_match = item_matches[0] if item_matches else None
+            
+            # Parse quantity from the extracted data
+            try:
+                quantity = int(item_data.get("Amount", 1))
+            except (ValueError, TypeError):
+                quantity = 1
+            
+            # Find the product ID for the best match
+            matched_product = None
+            if best_match:
+                matched_product = find_product_by_description(best_match["match"])
+                if matched_product:
+                    logger.info(f"Found product {matched_product.id} for match: {best_match['match']}")
+                else:
+                    logger.warning(f"No product found in database for match: {best_match['match']}")
+            
             line_item = LineItem(
-                order_id=order_id,
-                extracted_text=item['extracted_text'],
-                quantity=item['quantity'],
-                matches=item['matches']
+                order_id=order.id,
+                extracted_text=request_item,
+                matched_product_id=matched_product.id if matched_product else None,
+                confidence_score=best_match['score'] if best_match else 0.0,
+                quantity=quantity
             )
-            db.add(line_item)
+            db_session.add(line_item)
+            logger.info(f"Created line item: {line_item.extracted_text} (confidence: {line_item.confidence_score})")
         
         # Update order status
-        order.status = OrderStatus.PENDING_REVIEW
-        db.commit()
+        order.status = 'needs_review'
+        db_session.commit()
+        logger.info(f"Order {order.id} processed successfully")
         
-        logger.info(f"Successfully processed order {order_id}")
+        return order
     except Exception as e:
-        logger.error(f"Error processing order {order_id}: {str(e)}")
-        order.status = OrderStatus.ERROR
-        db.commit()
-        raise 
+        logger.error(f"Error processing order: {str(e)}")
+        # If anything fails, mark the order as error
+        if order:
+            order.status = 'error'
+            db_session.commit()
+        raise e 
